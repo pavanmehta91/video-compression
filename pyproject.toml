@@ -1,0 +1,10 @@
+[project]
+name = "video-compression"
+version = "0.1.0"
+description = "Compress Mac and Android video folders locally with VideoToolbox"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false

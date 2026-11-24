@@ -1,0 +1,26 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.video-compress.*/
+/Video Pilot.*/
+*.[mM][pP]4
+*.[mM][oO][vV]
+*.[mM]4[vV]
+*.[mM][kK][vV]
+*.[aA][vV][iI]
+*.[wW][eE][bB][mM]
+*.[wW][mM][vV]
+*.[fF][lL][vV]
+*.3[gG][pP]
+*.3[gG]2
+*.[mM][tT][sS]
+*.[mM]2[tT][sS]
+*.[mM][pP][gG]
+*.[mM][pP][eE][gG]
+*.[vV][oO][bB]
+*.[oO][gG][vV]
+*.[tT][sS]
+*.[aA][sS][fF]
