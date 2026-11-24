@@ -39,6 +39,10 @@ class SkipVideo(Exception):
     """A source was left alone for a reported reason."""
 
 
+class Cancelled(Exception):
+    """The user cancelled before encoding."""
+
+
 def capture(command):
     result = subprocess.run(command, capture_output=True, check=False)
     if result.returncode:
@@ -60,6 +64,11 @@ class Android:
         self.shell("test", "-d", root)
         found = self.shell("find", str(root).rstrip("/") + "/", "-type", "d", "-name", TEMP_PREFIX + "*",
                            "-prune", "-o", "-type", "f", "-print0")
+        return [PurePosixPath(os.fsdecode(path)) for path in found.split(b"\0") if path]
+
+    def folders(self, root):
+        found = self.shell("find", str(root).rstrip("/") + "/", "-mindepth", "1",
+                           "-maxdepth", "1", "-type", "d", "-print0")
         return [PurePosixPath(os.fsdecode(path)) for path in found.split(b"\0") if path]
 
     def stamp(self, path):
@@ -360,8 +369,131 @@ def compress(source, destination, android, args):
         return report
 
 
+def choose(prompt, options, default=None):
+    print(f"\n{prompt}")
+    for number, label in enumerate(options, 1):
+        print(f"  {number}. {label}")
+    print("  0. Cancel")
+    while True:
+        answer = input(f"Choice [{default}]: " if default else "Choice: ").strip()
+        if not answer and default:
+            return default - 1
+        if answer == "0":
+            raise Cancelled
+        if answer.isascii() and answer.isdecimal() and len(answer) <= len(str(len(options))):
+            number = int(answer)
+            if 1 <= number <= len(options):
+                return number - 1
+        print("Enter one of the listed numbers.")
+
+
+def folder_path(value, android):
+    if android:
+        path = PurePosixPath(value)
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError("Use an absolute Android path such as /sdcard/Movies.")
+        return path
+    path = Path(value).expanduser().resolve(strict=True)
+    if not path.is_dir():
+        raise ValueError("Choose a directory.")
+    return path
+
+
+def browse_folder(android):
+    current = PurePosixPath("/sdcard") if android else Path.home().resolve()
+    while True:
+        try:
+            folders = android.folders(current) if android else [
+                path for path in current.iterdir() if path.is_dir()
+            ]
+        except (OSError, RuntimeError) as error:
+            print(f"Could not list folders. {error}")
+            folders = []
+        folders = sorted((path for path in folders if not path.name.startswith(".")),
+                         key=lambda path: (path.name.casefold(), path.name))
+        actions = ["Use this folder", "Enter a folder path", "Go up one level"]
+        choice = choose(f"Folder {str(current)!r}", actions + [repr(p.name) for p in folders])
+        if choice == 0:
+            return current
+        if choice == 1:
+            text = input("Folder path (press Enter to go back): ")
+            if text:
+                try:
+                    path = folder_path(text, android)
+                    if android:
+                        android.shell("test", "-d", path)
+                    current = path
+                except (OSError, RuntimeError, ValueError) as error:
+                    print(f"Could not open folder {text!r}. {error}")
+        elif choice == 2:
+            current = current.parent
+        else:
+            current = folders[choice - len(actions)]
+            if not android:
+                current = current.resolve()
+
+
+def configure_interactive(args):
+    android = None
+    while choose("Where are the videos?", ["This Mac", "Android phone over USB"], default=1) == 1:
+        try:
+            rows = capture(["adb", "devices", "-l"]).decode().splitlines()
+        except (OSError, RuntimeError) as error:
+            print(f"Could not list Android devices. {error}")
+            continue
+        devices = [row for row in map(str.split, rows) if len(row) >= 2 and row[1] == "device"]
+        if not devices:
+            print("No authorized phone found. Connect it, unlock it, and allow USB debugging.")
+            continue
+        labels = []
+        for serial, _, *details in devices:
+            model = next((part[6:].replace("_", " ") for part in details
+                          if part.startswith("model:")), "Android")
+            labels.append(f"{model} ({serial})")
+        selection = choose("Choose a phone", labels, default=1 if len(labels) == 1 else None)
+        android = Android(devices[selection][0])
+        break
+
+    root = browse_folder(android)
+    preset = choose("Choose a compression preset",
+                    ["Family — HEVC, up to 1080p", "Course — H.264, up to 720p"], default=1)
+    args.preset = ("family", "course")[preset]
+    return root, android
+
+
+def run_jobs(root, android, args, jobs, *, preview=False):
+    if not preview:
+        for executable in ("ffmpeg", "ffprobe"):
+            if not shutil.which(executable):
+                raise RuntimeError(f"{executable} is required")
+    summary = Counter()
+    for index, (source, destination, reason) in enumerate(jobs, 1):
+        print(f"[{index}/{len(jobs)}] {str(source.relative_to(root))!r}", flush=True)
+        try:
+            if reason:
+                raise SkipVideo(reason)
+            if preview:
+                print(f"  Would create {str(destination.relative_to(root))!r}")
+                summary["planned"] += 1
+            else:
+                report = compress(source, destination, android, args)
+                print(f"  Saved {destination.name!r}. {report}")
+                summary["saved"] += 1
+        except SkipVideo as error:
+            print(f"  Skipped. {error}")
+            summary["skipped"] += 1
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
+            print(f"  Failed. {error}", file=sys.stderr)
+            summary["failed"] += 1
+    print(", ".join(f"{count} {label}" for label, count in summary.items())
+          or "No video files found.")
+    return 1 if summary["failed"] else 0
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, epilog="Run without arguments to open the interactive menu."
+    )
     parser.add_argument("folder", nargs="?", help="Mac folder or absolute Android folder")
     parser.add_argument("--list-devices", action="store_true", help="list phones seen by ADB")
     parser.add_argument("--device", metavar="SERIAL", help="read and write on this ADB device")
@@ -372,7 +504,8 @@ def main():
     parser.add_argument("--min-savings", type=float, default=10,
                         help="minimum percentage savings, 0 disables the early HEVC skip")
     args = parser.parse_args()
-    if not args.list_devices and not args.folder:
+    interactive = len(sys.argv) == 1
+    if not interactive and not args.list_devices and not args.folder:
         parser.error("a folder is required")
     if not 1 <= args.quality <= 100 or args.video_kbps <= 0 or not 0 <= args.min_savings <= 100:
         parser.error("quality must be 1–100, video bitrate positive, and minimum savings 0–100")
@@ -381,44 +514,29 @@ def main():
         if args.list_devices:
             print(capture(["adb", "devices", "-l"]).decode(), end="")
             return 0
-        android = Android(args.device) if args.device else None
-        if android:
-            root = PurePosixPath(args.folder)
-            if not root.is_absolute() or ".." in root.parts:
-                parser.error("use an absolute Android folder without '..'")
-            files = android.files(root)
+        if interactive:
+            root, android = configure_interactive(args)
         else:
-            root = Path(args.folder).expanduser().resolve(strict=True)
-            if not root.is_dir():
-                parser.error("folder must be a directory")
-            files = list(local_files(root))
-        if not args.dry_run:
-            for executable in ("ffmpeg", "ffprobe"):
-                if not shutil.which(executable):
-                    raise RuntimeError(f"{executable} is required")
-        jobs = list(candidates(files, android))
-        summary = Counter()
-        for index, (source, destination, reason) in enumerate(jobs, 1):
-            print(f"[{index}/{len(jobs)}] {str(source.relative_to(root))!r}", flush=True)
+            android = Android(args.device) if args.device else None
             try:
-                if reason:
-                    raise SkipVideo(reason)
-                if args.dry_run:
-                    print(f"  Would create {str(destination.relative_to(root))!r}")
-                    summary["planned"] += 1
-                else:
-                    report = compress(source, destination, android, args)
-                    print(f"  Saved {destination.name!r}. {report}")
-                    summary["saved"] += 1
-            except SkipVideo as error:
-                print(f"  Skipped. {error}")
-                summary["skipped"] += 1
-            except (OSError, RuntimeError, ValueError, KeyError) as error:
-                print(f"  Failed. {error}", file=sys.stderr)
-                summary["failed"] += 1
-        print(", ".join(f"{count} {label}" for label, count in summary.items())
-              or "No video files found.")
-        return 1 if summary["failed"] else 0
+                root = folder_path(args.folder, android)
+            except ValueError as error:
+                parser.error(str(error))
+        files = android.files(root) if android else list(local_files(root))
+        jobs = list(candidates(files, android))
+        if interactive:
+            print(f"\nPreview for {str(root)!r} using the {args.preset} preset")
+            run_jobs(root, android, args, jobs, preview=True)
+            count = sum(reason is None for _, _, reason in jobs)
+            if not count:
+                return 0
+            answer = input(f"\nStart compression for {count} candidate(s)? [y/N] ").strip().lower()
+            if answer not in {"y", "yes"}:
+                raise Cancelled
+        return run_jobs(root, android, args, jobs, preview=args.dry_run)
+    except (Cancelled, EOFError):
+        print("\nCancelled. No encoding started.")
+        return 0
     except (OSError, RuntimeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

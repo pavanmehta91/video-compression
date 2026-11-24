@@ -20,7 +20,27 @@ output formats, tracks, and metadata. FFmpeg encodes through VideoToolbox and
 decodes the output as a validation check. ADB transfers one file at a time
 when working on a phone.
 
-## Compress an Android folder
+## Interactive mode
+
+Run the CLI without arguments from the project directory.
+
+```sh
+uv run video_compress.py
+```
+
+1. Choose **This Mac** or **Android phone over USB**. For Android, connect and
+   unlock the phone, enable **USB debugging**, and accept the authorization
+   prompt. The menu lists authorized devices by model and serial.
+2. Browse to the folder, then choose **Use this folder**. You can also choose
+   **Enter a folder path** to paste a path. On Android the browser starts at
+   `/sdcard`, where you can open folders such as `DCIM`, `Movies`, and `Download`.
+3. Choose **Family** or **Course**. Review the planned `-small.mp4` copies, then
+   type `y` to begin. Press Enter at the confirmation prompt to cancel.
+
+Each run scans the selected folder and its subfolders. To use custom preset
+settings or run from a script, pass the arguments below.
+
+## Compress an Android folder with arguments
 
 Run these commands from the project directory. Connect and unlock your phone,
 enable **USB debugging** in Developer options, and accept the authorization
@@ -57,7 +77,7 @@ uv run video_compress.py "/sdcard/Movies/My Course" --device "$serial" --preset 
 uv run video_compress.py /sdcard/DCIM/Camera --device "$serial" --preset family --dry-run
 ```
 
-## Compress a Mac folder
+## Compress a Mac folder with arguments
 
 ```sh
 uv run video_compress.py "$HOME/Movies/Family Videos" --dry-run
