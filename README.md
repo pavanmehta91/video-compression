@@ -1,8 +1,8 @@
 # Video Compression
 
 Compress a folder of videos on a Mac or an ADB-connected Android phone. For example,
-`Courses/Lesson 01.MOV` produces `Courses/Lesson 01-small.mp4`. The folder is
-scanned recursively and the original stays in place.
+`Courses/Lesson 01.MOV` produces `Courses/Lesson 01-small.mp4`. Only videos
+directly in the selected folder are included, and the original stays in place.
 
 ## Setup
 
@@ -14,14 +14,37 @@ brew install --cask android-platform-tools  # For Android folders
 uv sync --locked
 ```
 
-The CLI uses Python 3.11 or later and has zero third-party Python runtime
-dependencies. uv manages the project's `.venv` and lockfile and installs the
+The standard CLI uses Python 3.11 or later and has zero third-party Python
+runtime dependencies. uv manages the project's `.venv` and lockfile and installs the
 `video-compress` command. FFprobe reads the source and
 output formats, tracks, and metadata. FFmpeg encodes through VideoToolbox and
 decodes the output as a validation check. ADB transfers one file at a time
 when working on a phone.
 
-## Interactive mode
+## Full-screen terminal interface
+
+```sh
+uv run --extra tui video-compress --tui
+```
+
+Choose **This Mac** or a connected Android phone, select a preset, then enter a
+folder path or open **Browse**. Use Up and Down to highlight a folder, Right
+to open it, and Left to go up. Enter or Space selects the highlighted folder.
+**Use current folder** selects the folder whose contents you are viewing.
+**Refresh devices** rescans for
+authorized phones. Use **Preview** to see the planned filenames, then **Start**
+to compress.
+
+The progress bar shows the current video's encoded percentage. The status line
+shows when the tool is copying, analyzing, validating, or saving. The results
+panel lists saved sizes and savings, plus any skipped files and errors.
+Use **Stop** or <kbd>Ctrl</kbd>+<kbd>X</kbd> to stop the run. Copying or validation
+may finish its current step before the run stops. Preview the same folder again
+to resume. <kbd>Ctrl</kbd>+<kbd>Q</kbd> quits when idle.
+
+The `tui` extra installs Textual for the full-screen interface.
+
+## Numbered menu
 
 Run the CLI without arguments from the project directory.
 
@@ -38,8 +61,8 @@ uv run video-compress
 3. Choose **Family** or **Course**. Review the planned `-small.mp4` copies, then
    type `y` to begin. Press Enter at the confirmation prompt to cancel.
 
-Each run scans the selected folder and its subfolders. To use custom preset
-settings or run from a script, pass the arguments below.
+Each run scans only the selected folder. To use custom preset settings or run
+from a script, pass the arguments below.
 
 ## Compress an Android folder with arguments
 
@@ -64,8 +87,8 @@ adb -s "$serial" shell ls -1 /sdcard/Movies/
 Pass the phone's absolute folder path as the first argument and select the phone
 with `--device "$serial"`. Android's **Internal storage** is available at
 `/sdcard`. Common starting folders are `/sdcard/DCIM/Camera`, `/sdcard/Movies`,
-and `/sdcard/Download`. Quote the path if it contains spaces. The CLI scans the
-selected folder and all its subfolders.
+and `/sdcard/Download`. Quote the path if it contains spaces. The CLI includes
+only videos directly inside the selected folder.
 
 ```sh
 # Preview just one course folder
@@ -92,9 +115,12 @@ uv run video-compress "$HOME/Movies/Family Videos" --preset family
 | `family` (default) | Camera and family videos | HEVC MP4 up to 1080p. Keeps the source frame cadence and rotation. Copies AAC audio where possible. | `--quality 60` by default. Higher values may preserve more detail and produce larger files. |
 | `course` | Lessons for an older TV | H.264 Main MP4 up to 1280×720 at 30 fps with stereo AAC-LC at 96 kbps. | `--video-kbps 1000` by default. Try `--video-kbps 1500` if small text is hard to read. |
 
-Both presets save an output only if it is at least 10% smaller by default.
-Use `--min-savings 0` to try low-bitrate HEVC sources and save any output that
-is at least as small as its source.
+Before encoding, FFprobe checks whether an MP4 already fits the preset.
+**Family** skips HEVC MP4s within the resolution limit at up to 2 Mbps total.
+**Course** skips TV-compatible H.264 MP4s near or below the selected video
+bitrate target. Both presets save a new copy only if it is at least 10%
+smaller by default. Use `--min-savings 0` to bypass the early bitrate check
+and save any output that is at least as small as its source.
 
 Dry runs show candidate names and existing output collisions. The bitrate and
 savings decisions happen during a real run. Rerun the same command after an

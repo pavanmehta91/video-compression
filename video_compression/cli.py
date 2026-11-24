@@ -40,7 +40,7 @@ class SkipVideo(Exception):
 
 
 class Cancelled(Exception):
-    """The user cancelled before encoding."""
+    """The user cancelled the operation."""
 
 
 def capture(command):
@@ -62,8 +62,8 @@ class Android:
 
     def files(self, root):
         self.shell("test", "-d", root)
-        found = self.shell("find", str(root).rstrip("/") + "/", "-type", "d", "-name", TEMP_PREFIX + "*",
-                           "-prune", "-o", "-type", "f", "-print0")
+        found = self.shell("find", str(root).rstrip("/") + "/", "-mindepth", "1",
+                           "-maxdepth", "1", "-type", "f", "-print0")
         return [PurePosixPath(os.fsdecode(path)) for path in found.split(b"\0") if path]
 
     def folders(self, root):
@@ -118,15 +118,7 @@ class Android:
 
 
 def local_files(root):
-    def report_error(error):
-        raise error
-
-    for directory, folders, files in os.walk(root, onerror=report_error):
-        folders[:] = [name for name in folders if not name.startswith(TEMP_PREFIX)]
-        for name in files:
-            path = Path(directory) / name
-            if not path.is_symlink() and path.is_file():
-                yield path
+    return [path for path in root.iterdir() if not path.is_symlink() and path.is_file()]
 
 
 def path_key(path, android):
@@ -192,24 +184,38 @@ def recording_date(info):
     return value
 
 
-def encode(command, duration):
-    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as process:
+def console_progress(stage, percent=None):
+    if stage == "Encoding" and sys.stdout.isatty():
+        print(f"\r  Encoding {percent:3.0f}%", end="\n" if percent == 100 else "", flush=True)
+
+
+def encode(command, duration, progress):
+    with tempfile.TemporaryFile() as errors, subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=errors, text=True
+    ) as process:
         try:
+            progress("Encoding", 0)
             for line in process.stdout:
                 key, _, value = line.strip().partition("=")
-                if sys.stdout.isatty() and key == "out_time_us" and value != "N/A":
+                if key == "out_time_us" and value != "N/A":
                     percent = max(0, min(99, int(value) * 100 / (duration * 1_000_000)))
-                    print(f"\r  Encoding {percent:3.0f}%", end="", flush=True)
-            if sys.stdout.isatty():
-                print("\r", end="", flush=True)
+                    progress("Encoding", percent)
             if process.wait():
-                raise RuntimeError("FFmpeg encoding failed")
-        except KeyboardInterrupt:
-            process.terminate()
+                errors.seek(0)
+                detail = errors.read().decode(errors="replace").strip()
+                raise RuntimeError(detail or "FFmpeg encoding failed")
+            progress("Encoding", 100)
+        except (Exception, KeyboardInterrupt):
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
             raise
 
 
-def convert(source, output, info, args):
+def convert(source, output, info, args, progress):
     family = args.preset == "family"
     video, = streams(info, "video")
     subtitles = streams(info, "subtitle")
@@ -219,7 +225,8 @@ def convert(source, output, info, args):
             or any("DOVI" in data["side_data_type"] for data in video.get("side_data_list", []))):
         raise SkipVideo("HDR or Dolby Vision needs a separate preset")
 
-    command = ["ffmpeg", "-nostdin", "-v", "error", "-n", "-progress", "pipe:1"]
+    command = ["ffmpeg", "-nostdin", "-v", "error", "-n", "-stats_period", "0.25",
+               "-progress", "pipe:1"]
     if family:
         command += ["-noautorotate"]
     command += ["-i", str(source), "-map", "0:V:0", "-map", "0:a?", "-map", "0:s?",
@@ -259,8 +266,9 @@ def convert(source, output, info, args):
     pixel_format = "p010le" if family and high_depth else "nv12"
     command += ["-vf", f"{scale},format={pixel_format}", "-allow_sw", "0", "-movflags",
                 "+faststart", str(output)]
-    encode(command, float(info["format"]["duration"]))
+    encode(command, float(info["format"]["duration"]), progress)
 
+    progress("Checking output")
     rendered = probe(output)
     if family:
         actual = streams(rendered, "video")[0]
@@ -317,11 +325,44 @@ def validate(source, result, output, family):
              "-enc_time_base:v", "demux", "-f", "null", "-"])
 
 
-def compress(source, destination, android, args):
+def efficient_reason(source, info, video, args, total_bitrate):
+    media_format = info["format"]
+    if (args.min_savings == 0 or source.suffix.lower() != ".mp4"
+            or "mp4" not in media_format.get("format_name", "").split(",")
+            or media_format.get("tags", {}).get("major_brand", "").strip() == "qt"):
+        return None
+    width, height = video["width"], video["height"]
+    if args.preset == "family":
+        short, long = sorted((width, height))
+        if video["codec_name"] == "hevc" and short <= 1080 and long <= 1920 and total_bitrate <= 2_000_000:
+            return f"already a low-bitrate HEVC MP4 ({total_bitrate / 1000:.0f} kbps total)"
+        return None
+
+    audio = streams(info, "audio")
+    target = args.video_kbps * 1000
+    stream_bitrate = video.get("bit_rate")
+    # Allow normal swings around the encoder's average bitrate target.
+    if (
+        video["codec_name"] == "h264"
+        and video.get("profile") in {"Baseline", "Constrained Baseline", "Main"}
+        and 0 < video.get("level", 0) <= 31
+        and video.get("pix_fmt") == "yuv420p"
+        and width <= 1280 and height <= 720 and rotation(video) == 0 and frame_rate(video) <= 30
+        and all(track["codec_name"] == "aac" and track.get("profile") == "LC"
+                and 0 < track.get("channels", 0) <= 2 for track in audio)
+        and (not stream_bitrate or stream_bitrate == "N/A" or int(stream_bitrate) <= target * 1.1)
+        and total_bitrate <= (target + len(audio) * 96_000) * 1.1
+    ):
+        return f"already a low-bitrate, TV-compatible MP4 ({total_bitrate / 1000:.0f} kbps total)"
+    return None
+
+
+def compress(source, destination, android, args, progress):
     with tempfile.TemporaryDirectory(prefix=TEMP_PREFIX,
                                      dir=None if android else source.parent) as work:
         output = Path(work) / "encode.mp4"
         if android:
+            progress("Copying from Android")
             stamp = android.stamp(source)
             local = Path(work) / ("input" + source.suffix)
             android.pull(source, local)
@@ -329,6 +370,7 @@ def compress(source, destination, android, args):
                 raise RuntimeError("Source changed during transfer")
         else:
             local = source
+        progress("Analyzing")
         original_stat = local.stat()
         original_size = original_stat.st_size
         info = probe(local)
@@ -339,23 +381,23 @@ def compress(source, destination, android, args):
             raise SkipVideo("could not determine duration")
         video = streams(info, "video")[0]
         family = args.preset == "family"
-        if (args.min_savings > 0 and family and local.suffix.lower() == ".mp4"
-                and video["codec_name"] == "hevc"
-                and min(video["width"], video["height"]) <= 1080
-                and max(video["width"], video["height"]) <= 1920
-                and original_size * 8 / duration <= 2_000_000):
-            raise SkipVideo("already a low-bitrate HEVC MP4")
+        reason = efficient_reason(source, info, video, args, original_size * 8 / duration)
+        if reason:
+            raise SkipVideo(reason)
 
-        result = convert(local, output, info, args)
+        result = convert(local, output, info, args, progress)
         size = output.stat().st_size
         savings = 100 * (original_size - size) / original_size
         report = f"{original_size / 1e6:.1f} MB → {size / 1e6:.1f} MB ({savings:.1f}% smaller)"
         if savings < args.min_savings:
             raise SkipVideo(f"{report}. Below the {args.min_savings:g}% savings threshold")
+        progress("Validating")
         validate(info, result, output, family)
         if android:
+            progress("Copying to Android")
             android.publish(output, destination, source, stamp)
         else:
+            progress("Saving")
             current = local.stat()
             if (current.st_ino, current.st_size, current.st_mtime_ns) != (
                 original_stat.st_ino, original_size, original_stat.st_mtime_ns
@@ -399,18 +441,20 @@ def folder_path(value, android):
     return path
 
 
+def child_folders(root, android):
+    folders = android.folders(root) if android else [path for path in root.iterdir() if path.is_dir()]
+    return sorted((path for path in folders if not path.name.startswith(".")),
+                  key=lambda path: (path.name.casefold(), path.name))
+
+
 def browse_folder(android):
     current = PurePosixPath("/sdcard") if android else Path.home().resolve()
     while True:
         try:
-            folders = android.folders(current) if android else [
-                path for path in current.iterdir() if path.is_dir()
-            ]
+            folders = child_folders(current, android)
         except (OSError, RuntimeError) as error:
             print(f"Could not list folders. {error}")
             folders = []
-        folders = sorted((path for path in folders if not path.name.startswith(".")),
-                         key=lambda path: (path.name.casefold(), path.name))
         actions = ["Use this folder", "Enter a folder path", "Go up one level"]
         choice = choose(f"Folder {str(current)!r}", actions + [repr(p.name) for p in folders])
         if choice == 0:
@@ -433,25 +477,32 @@ def browse_folder(android):
                 current = current.resolve()
 
 
+def authorized_devices():
+    rows = capture(["adb", "devices", "-l"]).decode().splitlines()
+    devices = []
+    for row in map(str.split, rows):
+        if len(row) >= 2 and row[1] == "device":
+            serial, _, *details = row
+            model = next((part[6:].replace("_", " ") for part in details
+                          if part.startswith("model:")), "Android")
+            devices.append((f"{model} ({serial})", serial))
+    return devices
+
+
 def configure_interactive(args):
     android = None
     while choose("Where are the videos?", ["This Mac", "Android phone over USB"], default=1) == 1:
         try:
-            rows = capture(["adb", "devices", "-l"]).decode().splitlines()
+            devices = authorized_devices()
         except (OSError, RuntimeError) as error:
             print(f"Could not list Android devices. {error}")
             continue
-        devices = [row for row in map(str.split, rows) if len(row) >= 2 and row[1] == "device"]
         if not devices:
             print("No authorized phone found. Connect it, unlock it, and allow USB debugging.")
             continue
-        labels = []
-        for serial, _, *details in devices:
-            model = next((part[6:].replace("_", " ") for part in details
-                          if part.startswith("model:")), "Android")
-            labels.append(f"{model} ({serial})")
+        labels = [label for label, _ in devices]
         selection = choose("Choose a phone", labels, default=1 if len(labels) == 1 else None)
-        android = Android(devices[selection][0])
+        android = Android(devices[selection][1])
         break
 
     root = browse_folder(android)
@@ -461,30 +512,43 @@ def configure_interactive(args):
     return root, android
 
 
+def plan_jobs(root, android):
+    files = android.files(root) if android else local_files(root)
+    return list(candidates(files, android))
+
+
+def check_media_tools():
+    for executable in ("ffmpeg", "ffprobe"):
+        if not shutil.which(executable):
+            raise RuntimeError(f"{executable} is required")
+
+
+def run_job(source, destination, android, args, reason, progress=console_progress):
+    if reason:
+        return "skipped", reason
+    try:
+        report = compress(source, destination, android, args, progress)
+        return "saved", f"{destination.name!r}. {report}"
+    except SkipVideo as error:
+        return "skipped", str(error)
+    except (OSError, RuntimeError, ValueError, KeyError) as error:
+        return "failed", str(error)
+
+
 def run_jobs(root, android, args, jobs, *, preview=False):
     if not preview:
-        for executable in ("ffmpeg", "ffprobe"):
-            if not shutil.which(executable):
-                raise RuntimeError(f"{executable} is required")
+        check_media_tools()
     summary = Counter()
     for index, (source, destination, reason) in enumerate(jobs, 1):
         print(f"[{index}/{len(jobs)}] {str(source.relative_to(root))!r}", flush=True)
-        try:
-            if reason:
-                raise SkipVideo(reason)
-            if preview:
-                print(f"  Would create {str(destination.relative_to(root))!r}")
-                summary["planned"] += 1
-            else:
-                report = compress(source, destination, android, args)
-                print(f"  Saved {destination.name!r}. {report}")
-                summary["saved"] += 1
-        except SkipVideo as error:
-            print(f"  Skipped. {error}")
-            summary["skipped"] += 1
-        except (OSError, RuntimeError, ValueError, KeyError) as error:
-            print(f"  Failed. {error}", file=sys.stderr)
-            summary["failed"] += 1
+        if preview and not reason:
+            print(f"  Would create {str(destination.relative_to(root))!r}")
+            summary["planned"] += 1
+            continue
+        status, detail = run_job(source, destination, android, args, reason)
+        print(f"  {status.capitalize()}. {detail}",
+              file=sys.stderr if status == "failed" else sys.stdout)
+        summary[status] += 1
     print(", ".join(f"{count} {label}" for label, count in summary.items())
           or "No video files found.")
     return 1 if summary["failed"] else 0
@@ -494,23 +558,36 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, epilog="Run without arguments to open the interactive menu."
     )
-    parser.add_argument("folder", nargs="?", help="Mac folder or absolute Android folder")
+    parser.add_argument("folder", nargs="?", help="Mac or absolute Android folder (direct files only)")
     parser.add_argument("--list-devices", action="store_true", help="list phones seen by ADB")
     parser.add_argument("--device", metavar="SERIAL", help="read and write on this ADB device")
     parser.add_argument("--preset", choices=("family", "course"), default="family")
     parser.add_argument("--dry-run", action="store_true", help="list planned outputs without encoding")
+    parser.add_argument("--tui", action="store_true", help="launch the full-screen terminal interface")
     parser.add_argument("--quality", type=int, default=60, help="family HEVC quality, 1–100")
     parser.add_argument("--video-kbps", type=int, default=1000, help="course average video kbps")
     parser.add_argument("--min-savings", type=float, default=10,
-                        help="minimum percentage savings, 0 disables the early HEVC skip")
+                        help="minimum percentage savings, 0 disables the early bitrate check")
     args = parser.parse_args()
     interactive = len(sys.argv) == 1
-    if not interactive and not args.list_devices and not args.folder:
+    if not interactive and not args.list_devices and not args.folder and not args.tui:
         parser.error("a folder is required")
+    if args.tui and (args.list_devices or args.dry_run):
+        parser.error("--tui has its own device selection and preview")
     if not 1 <= args.quality <= 100 or args.video_kbps <= 0 or not 0 <= args.min_savings <= 100:
         parser.error("quality must be 1–100, video bitrate positive, and minimum savings 0–100")
 
     try:
+        if args.tui:
+            try:
+                from .tui import VideoCompressionApp
+            except ModuleNotFoundError as error:
+                if error.name != "textual":
+                    raise
+                raise RuntimeError("Install the TUI extra with uv run --extra tui video-compress --tui") from None
+            app = VideoCompressionApp(args)
+            app.run()
+            return app.return_code or 0
         if args.list_devices:
             print(capture(["adb", "devices", "-l"]).decode(), end="")
             return 0
@@ -522,8 +599,7 @@ def main():
                 root = folder_path(args.folder, android)
             except ValueError as error:
                 parser.error(str(error))
-        files = android.files(root) if android else list(local_files(root))
-        jobs = list(candidates(files, android))
+        jobs = plan_jobs(root, android)
         if interactive:
             print(f"\nPreview for {str(root)!r} using the {args.preset} preset")
             run_jobs(root, android, args, jobs, preview=True)
