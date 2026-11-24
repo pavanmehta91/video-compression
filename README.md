@@ -14,8 +14,9 @@ brew install --cask android-platform-tools  # For Android folders
 uv sync --locked
 ```
 
-The CLI uses Python 3.11 or later and has zero third-party Python dependencies.
-uv manages the project's `.venv` and lockfile. FFprobe reads the source and
+The CLI uses Python 3.11 or later and has zero third-party Python runtime
+dependencies. uv manages the project's `.venv` and lockfile and installs the
+`video-compress` command. FFprobe reads the source and
 output formats, tracks, and metadata. FFmpeg encodes through VideoToolbox and
 decodes the output as a validation check. ADB transfers one file at a time
 when working on a phone.
@@ -25,7 +26,7 @@ when working on a phone.
 Run the CLI without arguments from the project directory.
 
 ```sh
-uv run video_compress.py
+uv run video-compress
 ```
 
 1. Choose **This Mac** or **Android phone over USB**. For Android, connect and
@@ -47,7 +48,7 @@ enable **USB debugging** in Developer options, and accept the authorization
 prompt on the phone. Then list the connected devices.
 
 ```sh
-uv run video_compress.py --list-devices
+uv run video-compress --list-devices
 ```
 
 Copy the serial from the first column of the row marked `device`. Set it
@@ -68,20 +69,20 @@ selected folder and all its subfolders.
 
 ```sh
 # Preview just one course folder
-uv run video_compress.py "/sdcard/Movies/My Course" --device "$serial" --preset course --dry-run
+uv run video-compress "/sdcard/Movies/My Course" --device "$serial" --preset course --dry-run
 
 # Create -small.mp4 copies beside the originals on that phone
-uv run video_compress.py "/sdcard/Movies/My Course" --device "$serial" --preset course
+uv run video-compress "/sdcard/Movies/My Course" --device "$serial" --preset course
 
 # Preview the camera folder with the family preset
-uv run video_compress.py /sdcard/DCIM/Camera --device "$serial" --preset family --dry-run
+uv run video-compress /sdcard/DCIM/Camera --device "$serial" --preset family --dry-run
 ```
 
 ## Compress a Mac folder with arguments
 
 ```sh
-uv run video_compress.py "$HOME/Movies/Family Videos" --dry-run
-uv run video_compress.py "$HOME/Movies/Family Videos" --preset family
+uv run video-compress "$HOME/Movies/Family Videos" --dry-run
+uv run video-compress "$HOME/Movies/Family Videos" --preset family
 ```
 
 ## Presets and settings
